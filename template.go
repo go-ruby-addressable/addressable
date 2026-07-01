@@ -298,7 +298,7 @@ func expandAssoc(v tvar, pairs [][2]string, info operatorInfo) string {
 // Addressable::Template#extract(uri). List/hash values are returned as []string /
 // map[string]string where the template variable exploded.
 func (t *Template) Extract(uri string) map[string]any {
-	re, names, kinds := t.buildRegexp()
+	re, names, specs := t.buildRegexp()
 	m := re.FindStringSubmatch(uri)
 	if m == nil {
 		return nil
@@ -306,7 +306,7 @@ func (t *Template) Extract(uri string) map[string]any {
 	out := make(map[string]any, len(names))
 	for i, name := range names {
 		raw := m[i+1]
-		out[name] = decodeExtracted(raw, kinds[i])
+		out[name] = decodeExtracted(raw, specs[i])
 	}
 	return out
 }
@@ -316,14 +316,26 @@ type extractKind int
 
 const (
 	kindSimple extractKind = iota // single string value
-	kindList                      // comma / sep list -> []string
+	kindList                      // separator-joined list -> []string
 	kindAssoc                     // query-style pairs -> map[string]string
 )
 
-func decodeExtracted(raw string, kind extractKind) any {
-	switch kind {
+// decodeSpec records how one captured group is decoded: its kind and, for a list,
+// the separator its items are joined by (empty means the value is a single item).
+type decodeSpec struct {
+	kind extractKind
+	sep  string
+}
+
+func decodeExtracted(raw string, spec decodeSpec) any {
+	switch spec.kind {
 	case kindList:
-		items := strings.Split(raw, ",")
+		var items []string
+		if spec.sep == "" {
+			items = []string{raw}
+		} else {
+			items = strings.Split(raw, spec.sep)
+		}
 		out := make([]string, len(items))
 		for i, it := range items {
 			out[i] = UnencodeComponent(it)
@@ -348,24 +360,24 @@ func decodeExtracted(raw string, kind extractKind) any {
 }
 
 // buildRegexp turns the template into an anchored regexp and the ordered list of
-// captured variable names + their post-processing kinds.
-func (t *Template) buildRegexp() (*regexp.Regexp, []string, []extractKind) {
+// captured variable names + their decode specs.
+func (t *Template) buildRegexp() (*regexp.Regexp, []string, []decodeSpec) {
 	var b strings.Builder
 	b.WriteString("^")
 	var names []string
-	var kinds []extractKind
+	var specs []decodeSpec
 	for _, p := range t.parts {
 		if p.expr == nil {
 			b.WriteString(regexp.QuoteMeta(p.literal))
 			continue
 		}
-		writeExprRegexp(&b, p.expr, &names, &kinds)
+		writeExprRegexp(&b, p.expr, &names, &specs)
 	}
 	b.WriteString("$")
-	return regexp.MustCompile(b.String()), names, kinds
+	return regexp.MustCompile(b.String()), names, specs
 }
 
-func writeExprRegexp(b *strings.Builder, e *texpr, names *[]string, kinds *[]extractKind) {
+func writeExprRegexp(b *strings.Builder, e *texpr, names *[]string, specs *[]decodeSpec) {
 	info := opInfo(e.op)
 	// A leading operator injects a fixed prefix character (., /, ;, ?, &, #).
 	if info.first != "" {
@@ -375,25 +387,37 @@ func writeExprRegexp(b *strings.Builder, e *texpr, names *[]string, kinds *[]ext
 		if i > 0 {
 			b.WriteString(regexp.QuoteMeta(info.sep))
 		}
-		kind := kindSimple
+		spec := decodeSpec{kind: kindSimple}
 		if v.explode {
 			if info.named {
-				kind = kindAssoc
+				spec.kind = kindAssoc
 			} else {
-				kind = kindList
+				spec.kind = kindList
+				// A default-operator ({list*}) explode has no reversible item
+				// separator, so the gem returns the raw run as a single element;
+				// operator explodes ({/list*}, {.list*}) split on the operator's
+				// separator character.
+				if e.op != 0 {
+					spec.sep = info.sep
+				}
 			}
 		}
 		*names = append(*names, v.name)
-		*kinds = append(*kinds, kind)
-		// Named operators (; ? &) emit "name=value"; consume the literal "name="
-		// prefix outside the capture so only the value is captured. Explode assoc
-		// values keep the whole "k=v&k=v" run (kindAssoc re-parses it).
+		*specs = append(*specs, spec)
+		// Named operators (; ? &) emit "name=value"; for a non-exploded var consume
+		// the literal "name=" prefix outside the capture so only the value is
+		// captured. An exploded assoc keeps the whole "k=v&k=v" run (kindAssoc
+		// re-parses it), so no fixed prefix is stripped.
 		if info.named && !v.explode {
 			b.WriteString(regexp.QuoteMeta(v.name) + "=")
 		}
 		switch {
 		case info.allowRes:
 			b.WriteString("(.*?)")
+		case v.explode:
+			// An exploded value spans its separators; capture the whole run up to
+			// the next fixed delimiter (?, #, or end-of-input handled by anchoring).
+			b.WriteString("(.+?)")
 		default:
 			b.WriteString("([^" + regexp.QuoteMeta(splitCharset(info.sep)) + "/?#]*?)")
 		}
@@ -401,10 +425,8 @@ func writeExprRegexp(b *strings.Builder, e *texpr, names *[]string, kinds *[]ext
 }
 
 // splitCharset returns the separator characters to exclude from a non-greedy match,
-// keeping the regexp class small.
+// keeping the regexp class small. It is only ever called with a non-empty operator
+// separator.
 func splitCharset(sep string) string {
-	if sep == "" {
-		return ","
-	}
 	return sep + ","
 }

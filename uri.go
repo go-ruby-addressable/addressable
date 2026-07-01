@@ -142,6 +142,15 @@ func splitAuthority(auth string) (userinfo *string, host string, port *int) {
 	return
 }
 
+// hostForOutput re-wraps an IPv6 (or otherwise colon-bearing) host literal in the
+// "[...]" brackets that parsing stripped, so serialization round-trips.
+func hostForOutput(h string) string {
+	if strings.ContainsRune(h, ':') && !strings.HasPrefix(h, "[") {
+		return "[" + h + "]"
+	}
+	return h
+}
+
 func parsePort(s string) *int {
 	if s == "" {
 		return nil
@@ -209,7 +218,7 @@ func (u *URI) Authority() *string {
 		b.WriteString(*u.userinfo)
 		b.WriteByte('@')
 	}
-	b.WriteString(*u.host)
+	b.WriteString(hostForOutput(*u.host))
 	if u.port != nil {
 		b.WriteByte(':')
 		b.WriteString(strconv.Itoa(*u.port))
